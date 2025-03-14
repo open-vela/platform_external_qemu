@@ -2178,7 +2178,9 @@ static void machvirt_init(MachineState *machine)
      * and otherwise we will use HVC (for backwards compatibility and
      * because if we're using KVM then we must use HVC).
      */
-    if (vms->secure && firmware_loaded) {
+    if (!strncmp("cortex-r", possible_cpus->cpus[0].type, 8)) {
+        vms->psci_conduit = QEMU_PSCI_CONDUIT_DISABLED;
+    } else if (vms->secure && firmware_loaded) {
         vms->psci_conduit = QEMU_PSCI_CONDUIT_DISABLED;
     } else if (vms->virt) {
         vms->psci_conduit = QEMU_PSCI_CONDUIT_SMC;
