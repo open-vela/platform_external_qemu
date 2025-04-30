@@ -2423,6 +2423,8 @@ static void machvirt_init(MachineState *machine)
 
     if (vms->secure && !vmc->no_secure_gpio) {
         create_gpio_devices(vms, VIRT_SECURE_GPIO, secure_sysmem);
+    } else {
+        create_gpio_devices(vms, VIRT_SECURE_GPIO, sysmem);
     }
 
      /* connect powerdown request */
