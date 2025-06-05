@@ -731,6 +731,7 @@ static void cortex_r52_initfn(Object *obj)
     set_feature(&cpu->env, ARM_FEATURE_BACKCOMPAT_CNTFRQ);
     set_feature(&cpu->env, ARM_FEATURE_CBAR_RO);
     set_feature(&cpu->env, ARM_FEATURE_AUXCR);
+    set_feature(&cpu->env, ARM_FEATURE_PMU);
     cpu->midr = 0x411fd133; /* r1p3 */
     cpu->revidr = 0x00000000;
     cpu->reset_fpsid = 0x41034023;
@@ -755,6 +756,7 @@ static void cortex_r52_initfn(Object *obj)
     cpu->isar.id_isar4 = 0x00010142;
     cpu->isar.id_isar5 = 0x00010001;
     cpu->isar.dbgdidr = 0x77168000;
+    cpu->isar.reset_pmcr_el0 = 0x41132000;
     cpu->clidr = (1 << 27) | (1 << 24) | 0x3;
     cpu->ccsidr[0] = 0x700fe01a; /* 32KB L1 dcache */
     cpu->ccsidr[1] = 0x201fe00a; /* 32KB L1 icache */
