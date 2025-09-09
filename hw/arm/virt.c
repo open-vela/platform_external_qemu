@@ -88,6 +88,24 @@
 #include "hw/char/pl011.h"
 #include "qemu/guest-random.h"
 
+/* Multi PCIe domains share basicallly same resources as upstream */
+
+#define PCIE_SIZE_ECAM       (16 * MiB)
+#define PCIE_SIZE_PIO        (64 * KiB)
+#define PCIE_ALGN_MMIO       (04 * KiB)
+
+/* Number of PCIe controllers */
+static uint8_t pcie_ndomain = 1;
+
+/* Config data for a PCIe doamin in multi-domain case */
+struct pcie_domain {
+    hwaddr  base_ecam, size_ecam;    /* ECAM region */
+    hwaddr  base_meml, size_meml;    /* MMIO 32b region */
+    hwaddr  base_memh, size_memh;    /* MMIO 64b region */
+    hwaddr  base_pio;                /* PIO region */
+    int     base_irq;                /* Legacy IRQ base */
+};
+
 static GlobalProperty arm_virt_compat[] = {
     { TYPE_VIRTIO_IOMMU_PCI, "aw-bits", "48" },
 };
@@ -1358,6 +1376,103 @@ static bool virt_firmware_init(VirtMachineState *vms,
     return pflash_blk0 || bios_name;
 }
 
+/* Get PCIe domain config data in multi-domain case */
+static void config_pcie(const VirtMachineState *vms, uint8_t domain,
+    struct pcie_domain *data)
+{
+    const uint8_t ndomain = pcie_ndomain;
+    const hwaddr PCIE_BASE = vms->memmap[VIRT_PCIE_MMIO].base;
+    const hwaddr PCIE_TOP  = vms->memmap[VIRT_MEM].base;
+    const hwaddr PCIE_SIZE = PCIE_TOP - PCIE_BASE;
+
+    /* We reuse upstream PCIe layout design like below:
+     * +--------------------+ <--- PCIE_BASE
+     * | Domain 0 MMIO      |
+     * +--------------------+
+     * | ...                |
+     * +--------------------+
+     * | Domain N MMIO      |
+     * +--------------------+
+     * | Domain N PIO       |  PCIE_SIZE_PIO
+     * +--------------------+
+     * | ...                |
+     * +--------------------+
+     * | Domain 0 PIO       |  PCIE_SIZE_PIO
+     * +--------------------+
+     * | Domain N ECAM      |  PCIE_SIZE_ECAM
+     * +--------------------+
+     * | ...                |
+     * +--------------------+
+     * | Domain 0 ECAM      |  PCIE_SIZE_ECAM
+     * +--------------------+  <--- PCIE_BASE + PCIE_SIZE
+     */
+    memset(data, 0, sizeof(*data));
+
+    data->size_ecam = PCIE_SIZE_ECAM;
+
+    if (vms->highmem_ecam) {
+        /* Only PIO in low memory */
+        data->size_meml = PCIE_SIZE - ndomain * PCIE_SIZE_PIO;
+        data->size_meml = ROUND_DOWN(data->size_meml / ndomain, PCIE_ALGN_MMIO);
+
+        data->base_pio  = PCIE_TOP - (domain + 1) * PCIE_SIZE_PIO;
+        data->base_ecam = vms->memmap[VIRT_HIGH_PCIE_ECAM].base
+                          + vms->memmap[VIRT_HIGH_PCIE_ECAM].size
+                          - domain * PCIE_SIZE_ECAM;
+        data->base_meml = PCIE_TOP - ndomain * PCIE_SIZE_PIO
+                          - (ndomain - domain) * data->size_meml;
+    } else {
+        /* Both ECAM and PIO in low memory */
+        data->size_meml = PCIE_SIZE - ndomain * (PCIE_SIZE_ECAM + PCIE_SIZE_PIO);
+        data->size_meml = ROUND_DOWN(data->size_meml / ndomain, PCIE_ALGN_MMIO);
+
+        data->base_ecam = PCIE_TOP - (domain + 1) * PCIE_SIZE_ECAM;
+        data->base_pio  = PCIE_TOP - ndomain * PCIE_SIZE_ECAM
+                          - (domain + 1) * PCIE_SIZE_PIO;
+        data->base_meml = PCIE_TOP - ndomain * (PCIE_SIZE_ECAM + PCIE_SIZE_PIO)
+                          - (ndomain - domain) * data->size_meml;
+    }
+
+    if (vms->highmem_mmio) {
+        /* Split high MMIO directly */
+        data->size_memh = vms->memmap[VIRT_HIGH_PCIE_MMIO].size / ndomain;
+        data->size_memh = ROUND_DOWN(data->size_memh, PCIE_ALGN_MMIO);
+
+        data->base_memh = vms->memmap[VIRT_HIGH_PCIE_MMIO].base
+                          + vms->memmap[VIRT_HIGH_PCIE_MMIO].size
+                          - (ndomain - domain) * data->size_memh;
+    }
+
+    if (0 == domain) {
+        /* Adjust primary meml to avoid wasting */
+        data->size_meml = PCIE_SIZE
+                          - ndomain * (vms->highmem_ecam ?
+                                              PCIE_SIZE_PIO :
+                                              PCIE_SIZE_ECAM + PCIE_SIZE_PIO)
+                          - (ndomain - 1 ) * data->size_meml;
+        data->base_meml = PCIE_BASE;
+
+        if (vms->highmem_mmio) {
+            data->size_memh = vms->memmap[VIRT_HIGH_PCIE_MMIO].size
+                              - (ndomain - 1) * data->size_memh;
+            data->base_memh = vms->memmap[VIRT_HIGH_PCIE_MMIO].base;
+        }
+
+        if (vms->highmem_ecam) {
+            /* Adjust primary ecam to avoid wasting */
+            data->size_ecam = vms->memmap[VIRT_HIGH_PCIE_ECAM].size
+                              - (ndomain - 1) * PCIE_SIZE_ECAM;
+            data->base_ecam = vms->memmap[VIRT_HIGH_PCIE_ECAM].base;
+        }
+
+        data->base_irq = vms->irqmap[VIRT_PCIE];
+    } else {
+
+        /* We allocate IRQs from the end to avoid conflisions */
+        data->base_irq = NUM_IRQS - 4 * domain;
+    }
+}
+
 static FWCfgState *create_fw_cfg(const VirtMachineState *vms, AddressSpace *as)
 {
     MachineState *ms = MACHINE(vms);
@@ -1497,42 +1612,45 @@ static void create_virtio_iommu_dt_bindings(VirtMachineState *vms)
                            bdf + 1, vms->iommu_phandle, bdf + 1, 0xffff - bdf);
 }
 
-static void create_pcie(VirtMachineState *vms)
+/* Create one PCIe domain, adapted from original create_pcie() */
+static void create_pcie(VirtMachineState *vms, uint8_t domain)
 {
-    hwaddr base_mmio = vms->memmap[VIRT_PCIE_MMIO].base;
-    hwaddr size_mmio = vms->memmap[VIRT_PCIE_MMIO].size;
-    hwaddr base_mmio_high = vms->memmap[VIRT_HIGH_PCIE_MMIO].base;
-    hwaddr size_mmio_high = vms->memmap[VIRT_HIGH_PCIE_MMIO].size;
-    hwaddr base_pio = vms->memmap[VIRT_PCIE_PIO].base;
-    hwaddr size_pio = vms->memmap[VIRT_PCIE_PIO].size;
-    hwaddr base_ecam, size_ecam;
-    hwaddr base = base_mmio;
-    int nr_pcie_buses;
-    int irq = vms->irqmap[VIRT_PCIE];
+    struct pcie_domain cfg;
     MemoryRegion *mmio_alias;
     MemoryRegion *mmio_reg;
     MemoryRegion *ecam_alias;
     MemoryRegion *ecam_reg;
     DeviceState *dev;
     char *nodename;
-    int i, ecam_id;
+    int i, nr_pcie_buses;
     PCIHostState *pci;
     MachineState *ms = MACHINE(vms);
     MachineClass *mc = MACHINE_GET_CLASS(ms);
 
+    config_pcie(vms, domain, &cfg);
+
     dev = qdev_new(TYPE_GPEX_HOST);
+
+    qdev_prop_set_uint16(dev, PCI_HOST_DOMAIN, domain);
+    qdev_prop_set_uint64(dev, PCI_HOST_ECAM_BASE, cfg.base_ecam);
+    qdev_prop_set_uint64(dev, PCI_HOST_ECAM_SIZE, cfg.size_ecam);
+    qdev_prop_set_uint64(dev, PCI_HOST_BELOW_4G_MMIO_BASE, cfg.base_meml);
+    qdev_prop_set_uint64(dev, PCI_HOST_BELOW_4G_MMIO_SIZE, cfg.size_meml);
+    qdev_prop_set_uint64(dev, PCI_HOST_ABOVE_4G_MMIO_BASE, cfg.base_memh);
+    qdev_prop_set_uint64(dev, PCI_HOST_ABOVE_4G_MMIO_SIZE, cfg.size_memh);
+    qdev_prop_set_uint64(dev, PCI_HOST_PIO_BASE, cfg.base_pio);
+    qdev_prop_set_uint64(dev, PCI_HOST_PIO_SIZE, PCIE_SIZE_PIO);
+    qdev_prop_set_uint32(dev, PCI_HOST_IRQ_LEGACY, cfg.base_irq);
+
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
 
-    ecam_id = VIRT_ECAM_ID(vms->highmem_ecam);
-    base_ecam = vms->memmap[ecam_id].base;
-    size_ecam = vms->memmap[ecam_id].size;
-    nr_pcie_buses = size_ecam / PCIE_MMCFG_SIZE_MIN;
+    nr_pcie_buses = cfg.size_ecam / PCIE_MMCFG_SIZE_MIN;
     /* Map only the first size_ecam bytes of ECAM space */
     ecam_alias = g_new0(MemoryRegion, 1);
     ecam_reg = sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 0);
     memory_region_init_alias(ecam_alias, OBJECT(dev), "pcie-ecam",
-                             ecam_reg, 0, size_ecam);
-    memory_region_add_subregion(get_system_memory(), base_ecam, ecam_alias);
+                             ecam_reg, 0, cfg.size_ecam);
+    memory_region_add_subregion(get_system_memory(), cfg.base_ecam, ecam_alias);
 
     /* Map the MMIO window into system address space so as to expose
      * the section of PCI MMIO space which starts at the same base address
@@ -1542,87 +1660,102 @@ static void create_pcie(VirtMachineState *vms)
     mmio_alias = g_new0(MemoryRegion, 1);
     mmio_reg = sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 1);
     memory_region_init_alias(mmio_alias, OBJECT(dev), "pcie-mmio",
-                             mmio_reg, base_mmio, size_mmio);
-    memory_region_add_subregion(get_system_memory(), base_mmio, mmio_alias);
+                             mmio_reg, cfg.base_meml, cfg.size_meml);
+    memory_region_add_subregion(get_system_memory(), cfg.base_meml, mmio_alias);
 
     if (vms->highmem_mmio) {
         /* Map high MMIO space */
         MemoryRegion *high_mmio_alias = g_new0(MemoryRegion, 1);
 
         memory_region_init_alias(high_mmio_alias, OBJECT(dev), "pcie-mmio-high",
-                                 mmio_reg, base_mmio_high, size_mmio_high);
-        memory_region_add_subregion(get_system_memory(), base_mmio_high,
+                                 mmio_reg, cfg.base_memh, cfg.size_memh);
+        memory_region_add_subregion(get_system_memory(), cfg.base_memh,
                                     high_mmio_alias);
     }
 
     /* Map IO port space */
-    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 2, base_pio);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 2, cfg.base_pio);
 
     for (i = 0; i < PCI_NUM_PINS; i++) {
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), i,
-                           qdev_get_gpio_in(vms->gic, irq + i));
-        gpex_set_irq_num(GPEX_HOST(dev), i, irq + i);
+                           qdev_get_gpio_in(vms->gic, cfg.base_irq + i));
+        gpex_set_irq_num(GPEX_HOST(dev), i, cfg.base_irq + i);
     }
 
     pci = PCI_HOST_BRIDGE(dev);
     pci->bypass_iommu = vms->default_bus_bypass_iommu;
     vms->bus = pci->bus;
-    if (vms->bus) {
+    if (vms->bus && 0 == domain) {
         pci_init_nic_devices(pci->bus, mc->default_nic);
     }
 
-    nodename = vms->pciehb_nodename = g_strdup_printf("/pcie@%" PRIx64, base);
+    nodename = vms->pciehb_nodename = g_strdup_printf("/pcie@%" PRIx64,
+                                                      cfg.base_meml);
     qemu_fdt_add_subnode(ms->fdt, nodename);
     qemu_fdt_setprop_string(ms->fdt, nodename,
                             "compatible", "pci-host-ecam-generic");
     qemu_fdt_setprop_string(ms->fdt, nodename, "device_type", "pci");
     qemu_fdt_setprop_cell(ms->fdt, nodename, "#address-cells", 3);
     qemu_fdt_setprop_cell(ms->fdt, nodename, "#size-cells", 2);
-    qemu_fdt_setprop_cell(ms->fdt, nodename, "linux,pci-domain", 0);
+    qemu_fdt_setprop_cell(ms->fdt, nodename, "linux,pci-domain", domain);
     qemu_fdt_setprop_cells(ms->fdt, nodename, "bus-range", 0,
                            nr_pcie_buses - 1);
     qemu_fdt_setprop(ms->fdt, nodename, "dma-coherent", NULL, 0);
 
     if (vms->msi_phandle) {
         qemu_fdt_setprop_cells(ms->fdt, nodename, "msi-map",
-                               0, vms->msi_phandle, 0, 0x10000);
+                               0, vms->msi_phandle, 0x10000 * domain, 0x10000);
     }
 
     qemu_fdt_setprop_sized_cells(ms->fdt, nodename, "reg",
-                                 2, base_ecam, 2, size_ecam);
+                                 2, cfg.base_ecam, 2, cfg.size_ecam);
 
     if (vms->highmem_mmio) {
         qemu_fdt_setprop_sized_cells(ms->fdt, nodename, "ranges",
                                      1, FDT_PCI_RANGE_IOPORT, 2, 0,
-                                     2, base_pio, 2, size_pio,
-                                     1, FDT_PCI_RANGE_MMIO, 2, base_mmio,
-                                     2, base_mmio, 2, size_mmio,
+                                     2, cfg.base_pio, 2, PCIE_SIZE_PIO,
+                                     1, FDT_PCI_RANGE_MMIO, 2, cfg.base_meml,
+                                     2, cfg.base_meml, 2, cfg.size_meml,
                                      1, FDT_PCI_RANGE_MMIO_64BIT,
-                                     2, base_mmio_high,
-                                     2, base_mmio_high, 2, size_mmio_high);
+                                     2, cfg.base_memh,
+                                     2, cfg.base_memh, 2, cfg.size_memh);
     } else {
         qemu_fdt_setprop_sized_cells(ms->fdt, nodename, "ranges",
                                      1, FDT_PCI_RANGE_IOPORT, 2, 0,
-                                     2, base_pio, 2, size_pio,
-                                     1, FDT_PCI_RANGE_MMIO, 2, base_mmio,
-                                     2, base_mmio, 2, size_mmio);
+                                     2, cfg.base_pio, 2, PCIE_SIZE_PIO,
+                                     1, FDT_PCI_RANGE_MMIO, 2, cfg.base_meml,
+                                     2, cfg.base_meml, 2, cfg.size_meml);
     }
 
     qemu_fdt_setprop_cell(ms->fdt, nodename, "#interrupt-cells", 1);
-    create_pcie_irq_map(ms, vms->gic_phandle, irq, nodename);
+    create_pcie_irq_map(ms, vms->gic_phandle, cfg.base_irq, nodename);
 
     if (vms->iommu) {
-        vms->iommu_phandle = qemu_fdt_alloc_phandle(ms->fdt);
+        if (0 == vms->iommu_phandle) {
+            vms->iommu_phandle = qemu_fdt_alloc_phandle(ms->fdt);
+        }
 
         switch (vms->iommu) {
         case VIRT_IOMMU_SMMUV3:
-            create_smmu(vms, vms->bus);
+            if (0 == domain) {
+                create_smmu(vms, vms->bus);
+            }
             qemu_fdt_setprop_cells(ms->fdt, nodename, "iommu-map",
-                                   0x0, vms->iommu_phandle, 0x0, 0x10000);
+                                   0x0, vms->iommu_phandle,
+                                   0x10000 * domain, 0x10000);
             break;
         default:
             g_assert_not_reached();
         }
+    }
+}
+
+static void create_pcies(VirtMachineState *vms)
+{
+    uint8_t n;
+
+    for (n = 0; n < pcie_ndomain; n++) {
+        create_pcie(vms, n);
     }
 }
 
@@ -2413,7 +2546,7 @@ static void machvirt_init(MachineState *machine)
 
     create_rtc(vms);
 
-    create_pcie(vms);
+    create_pcies(vms);
 
     if (has_ged && aarch64 && firmware_loaded && virt_is_acpi_enabled(vms)) {
         vms->acpi_dev = create_acpi_ged(vms);
@@ -3266,6 +3399,12 @@ static void virt_machine_class_init(ObjectClass *oc, void *data)
     object_class_property_set_description(oc, "highmem-mmio-size",
                                           "Set the high memory region size "
                                           "for PCI MMIO");
+
+    object_class_property_add_uint8_ptr(oc, "npd", &pcie_ndomain,
+                                        OBJ_PROP_FLAG_READWRITE);
+    object_class_property_set_description(oc, "npd",
+                                          "Number of PCIe domains "
+                                          "(default: 1)");
 
     object_class_property_add_str(oc, "gic-version", virt_get_gic_version,
                                   virt_set_gic_version);
