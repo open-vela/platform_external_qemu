@@ -148,7 +148,9 @@ static void gpex_host_realize(DeviceState *dev, Error **errp)
         s->irq[i].irq_num = -1;
     }
 
-    pci->bus = pci_register_root_bus(dev, "pcie.0", gpex_set_irq,
+    snprintf(s->path, sizeof(s->path), "%04x:00", s->domain);
+    snprintf(s->name, sizeof(s->name), "pcie.%x", s->domain);
+    pci->bus = pci_register_root_bus(dev, s->name, gpex_set_irq,
                                      gpex_swizzle_map_irq_fn,
                                      s, &s->io_mmio, &s->io_ioport, 0,
                                      s->num_irqs, TYPE_PCIE_BUS);
@@ -167,7 +169,8 @@ static void gpex_host_unrealize(DeviceState *dev)
 static const char *gpex_host_root_bus_path(PCIHostState *host_bridge,
                                           PCIBus *rootbus)
 {
-    return "0000:00";
+    GPEXHost *s = GPEX_HOST(DEVICE(BUS(rootbus)->parent));
+    return s->path;
 }
 
 static const Property gpex_host_properties[] = {
@@ -190,6 +193,8 @@ static const Property gpex_host_properties[] = {
     DEFINE_PROP_SIZE(PCI_HOST_ABOVE_4G_MMIO_SIZE, GPEXHost,
                      gpex_cfg.mmio64.size, 0),
     DEFINE_PROP_UINT8("num-irqs", GPEXHost, num_irqs, PCI_NUM_PINS),
+    DEFINE_PROP_UINT16(PCI_HOST_DOMAIN, GPEXHost, domain, 0),
+    DEFINE_PROP_INT32(PCI_HOST_IRQ_LEGACY, GPEXHost, gpex_cfg.irq, 0),
 };
 
 static void gpex_host_class_init(ObjectClass *klass, void *data)

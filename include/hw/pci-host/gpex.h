@@ -64,6 +64,10 @@ struct GPEXHost {
 
     bool allow_unmapped_accesses;
 
+    uint16_t  domain;
+    char      path[8];   /* 0000:00 */
+    char      name[10];  /* pcie.%x */
+
     struct GPEXConfig gpex_cfg;
 };
 
@@ -80,5 +84,7 @@ void acpi_dsdt_add_gpex_host(Aml *scope, uint32_t irq);
 #define PCI_HOST_BELOW_4G_MMIO_SIZE     "x-below-4g-mmio-size"
 #define PCI_HOST_ABOVE_4G_MMIO_BASE     "x-above-4g-mmio-base"
 #define PCI_HOST_ABOVE_4G_MMIO_SIZE     "x-above-4g-mmio-size"
+#define PCI_HOST_DOMAIN                 "x-domain"
+#define PCI_HOST_IRQ_LEGACY             "x-irq"
 
 #endif /* HW_GPEX_H */
