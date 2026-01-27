@@ -258,7 +258,11 @@ static void sdl_grab_start(struct sdl2_console *scon)
             SDL_WarpMouseInWindow(scon->real_window, guest_x, guest_y);
         }
     } else {
-        sdl_hide_cursor(scon);
+        // Directly set cursor state, avoid calling sdl_hide_cursor
+        if (!(scon->opts->has_show_cursor && scon->opts->show_cursor)) {
+            SDL_ShowCursor(SDL_DISABLE);
+            SDL_SetCursor(sdl_cursor_hidden);
+        }
     }
     SDL_SetWindowGrab(scon->real_window, SDL_TRUE);
     gui_grab = 1;
